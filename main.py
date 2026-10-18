@@ -843,7 +843,7 @@ class JrlpPlugin(Star):
                     days=self._married_days(marriage),
                     remain=self._remaining_days(marriage),
                 ),
-                f"{name}与{wife['name']}已经幸福地生活了{self._married_days(marriage)}天\n(剩余{self._remaining_days(marriage)}天)",
+                f"<zh>{name}与{wife['name']}已经幸福地生活了{self._married_days(marriage)}天\n(剩余{self._remaining_days(marriage)}天)</zh>\n<ja>結婚してからもう{self._married_days(marriage)}日も幸せに過ごしているよ。あと{self._remaining_days(marriage)}日よろしくね。</ja>",
             )
             yield event.chain_result(
                 self._chain(text, self._image_path_by_name(wife["name"]))
@@ -855,7 +855,7 @@ class JrlpPlugin(Star):
             text = await self._llm(
                 event,
                 PROMPT_JRLP_AGAIN.format(player=name, wife_name=wife["name"]),
-                f"{name}今天的老婆是{wife['name']}",
+                f"<zh>{name}今天的老婆是{wife['name']}</zh>\n<ja>今日のあなたの嫁はもう決まっているよ。大事にしてあげてね。</ja>",
             )
             yield event.chain_result(
                 self._chain(text, self._image_path_by_name(wife["name"]))
@@ -875,7 +875,7 @@ class JrlpPlugin(Star):
                 text = await self._llm(
                     event,
                     PROMPT_EMPTY.format(player=name),
-                    "获取老婆失败，本地角色图库为空。已自动开启后台异步下载任务（约263MB），稍候即可抽取。",
+                    "<zh>获取老婆失败，本地角色图库为空。已自动开启后台异步下载任务（约263MB），稍候即可抽取。</zh>\n<ja>まだ画像データが空っぽみたい。今バックグラウンドでダウンロードしているから、少し待ってからまた引いてね。</ja>",
                 )
                 yield event.plain_result(text)
             else:
@@ -894,7 +894,7 @@ class JrlpPlugin(Star):
         text = await self._llm(
             event,
             PROMPT_JRLP.format(player=name, wife_name=chara["name"]),
-            f"{name}今天的老婆是{chara['name']}",
+            f"<zh>{name}今天的老婆是{chara['name']}</zh>\n<ja>じゃーん、今日のあなたの嫁が決まったよ！仲良くしてね。</ja>",
         )
         yield event.chain_result(self._chain(text, chara["path"]))
 
@@ -909,7 +909,7 @@ class JrlpPlugin(Star):
             text = await self._llm(
                 event,
                 PROMPT_HLP_BLOCKED.format(player=name),
-                "你已经结婚了，不能换老婆哦！\n如需解除关系请先发 离婚",
+                "<zh>你已经结婚了，不能换老婆哦！\n如需解除关系请先发 离婚</zh>\n<ja>もう結婚しているんだから、勝手に嫁を変えちゃダメだよ！</ja>",
             )
             yield event.plain_result(text)
             return
@@ -918,7 +918,7 @@ class JrlpPlugin(Star):
             text = await self._llm(
                 event,
                 PROMPT_NO_WIFE_MARRY.format(player=name),
-                "你还没有今日老婆，先发 jrlp 获取一位吧",
+                "<zh>你还没有今日老婆，先发 jrlp 获取一位吧</zh>\n<ja>まだ今日の嫁がいないみたい。先に今日の嫁を引いてきてね。</ja>",
             )
             yield event.plain_result(text)
             return
@@ -931,7 +931,7 @@ class JrlpPlugin(Star):
                 PROMPT_HLP_LIMIT.format(
                     player=name, wife_name=wife_name, limit=self.daily_limit
                 ),
-                f"{name}今天的老婆是{wife_name}\n(每天最多换{self.daily_limit}次老婆哦)",
+                f"<zh>{name}今天的老婆是{wife_name}\n(每天最多换{self.daily_limit}次老婆哦)</zh>\n<ja>今日はもうこれ以上嫁を変えられないよ。一日{self.daily_limit}回までだからね。</ja>",
             )
             img = self._image_path_by_name(wife_name) if wife else None
             yield event.chain_result(self._chain(text, img))
@@ -950,7 +950,7 @@ class JrlpPlugin(Star):
                 text = await self._llm(
                     event,
                     PROMPT_EMPTY.format(player=name),
-                    "获取老婆失败，本地角色图库为空。已自动开启后台异步下载任务（约263MB），稍候即可抽取。",
+                    "<zh>获取老婆失败，本地角色图库为空。已自动开启后台异步下载任务（约263MB），稍候即可抽取。</zh>\n<ja>まだ画像データが空っぽみたい。今バックグラウンドでダウンロードしているから、少し待ってからまた引いてね。</ja>",
                 )
                 yield event.plain_result(text)
             else:
@@ -969,7 +969,7 @@ class JrlpPlugin(Star):
         text = await self._llm(
             event,
             PROMPT_HLP.format(player=name, wife_name=chara["name"]),
-            f"{name}的新老婆是{chara['name']}",
+            f"<zh>{name}的新老婆是{chara['name']}</zh>\n<ja>新しい嫁が決まったよ！今度こそ大切にしてあげてね。</ja>",
         )
         yield event.chain_result(self._chain(text, chara["path"]))
 
@@ -991,7 +991,7 @@ class JrlpPlugin(Star):
                     days=self._married_days(marriage),
                     remain=self._remaining_days(marriage),
                 ),
-                f"{name}与{wife['name']}已经幸福地生活了{self._married_days(marriage)}天",
+                f"<zh>{name}与{wife['name']}已经幸福地生活了{self._married_days(marriage)}天</zh>\n<ja>結婚してからもう{self._married_days(marriage)}日も一緒に過ごしているよ。</ja>",
             )
             yield event.chain_result(
                 self._chain(text, self._image_path_by_name(wife["name"]))
@@ -1003,7 +1003,7 @@ class JrlpPlugin(Star):
             text = await self._llm(
                 event,
                 PROMPT_NO_WIFE_MARRY.format(player=name),
-                "你还没有今日老婆，先发 jrlp 获取一位吧",
+                "<zh>你还没有今日老婆，先发 jrlp 获取一位吧</zh>\n<ja>まだ今日の嫁がいないみたい。先に今日の嫁を引いてきてね。</ja>",
             )
             yield event.plain_result(text)
             return
@@ -1017,7 +1017,7 @@ class JrlpPlugin(Star):
         text = await self._llm(
             event,
             PROMPT_MARRY.format(player=name, wife_name=wife["name"]),
-            f"恭喜{name}与{wife['name']}喜结连理！",
+            f"<zh>恭喜{name}与{wife['name']}喜结连理！</zh>\n<ja>結婚おめでとう！これからずっと末永くお幸せにね！</ja>",
         )
         yield event.chain_result(
             self._chain(text, self._image_path_by_name(wife["name"]))
@@ -1035,7 +1035,7 @@ class JrlpPlugin(Star):
             text = await self._llm(
                 event,
                 PROMPT_NOT_MARRIED.format(player=name),
-                "你还没有结婚哦",
+                "<zh>你还没有结婚哦</zh>\n<ja>あなたはまだ結婚していないよ。</ja>",
             )
             yield event.plain_result(text)
             return
@@ -1047,7 +1047,7 @@ class JrlpPlugin(Star):
         text = await self._llm(
             event,
             PROMPT_DIVORCE.format(player=name, wife_name=wife_name),
-            f"{name}与{wife_name}的缘分走到了尽头...",
+            f"<zh>{name}与{wife_name}的缘分走到了尽头...</zh>\n<ja>二人の縁はここまでみたい……ちょっと寂しいね。</ja>",
         )
         yield event.plain_result(text)
 
