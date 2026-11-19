@@ -35,6 +35,7 @@
 - **GENIE 语音联动兼容**：已开启语音插件时自动按双语格式驱动语音合成；未开语音插件时自动严格清洗为自然中文对白。
 - **容灾保底机制**：LLM 不可用或请求失败时自动回退到内置文案，保证基础功能不中断。
 - **数据持久化规范**：数据遵循 AstrBot 官方规范持久化保存在 `data/plugin_data/astrbot_plugin_LLM_jrlp/`，跨天自动重置换老婆次数与抽取状态。
+- **多 Bot 同群防刷屏与状态同步**：配置协调服务后，同群存在多个 Bot 时仅由随机 1 个 Bot 回复，并同步共享今日老婆、换老婆次数与婚姻状态数据。
 
 ## 配置项
 
@@ -44,6 +45,7 @@
 - `marriage_duration`：结婚维持天数（整数，默认 7）
 - `auto_download_images`：图库为空时是否自动拉取 Release 资源包（布尔值，默认 false，建议显式发送「jrlp 下载图库」确认）
 - `use_mirror_accelerate`：下载图库时是否优先使用国内加速镜像（布尔值，默认 false，直连 GitHub 官方源）
+- `enable_multi_bot_coord` / `coord_url` / `coord_bot_ids` / `coord_min_bots` / `coord_share_data`：多 Bot 同群防刷屏协调与共享数据配置（`coord_url` 留空时为单机模式）
 
 ## 问题反馈聊天群（想玩bot的也可以来）
 <img width="360" height="640" alt="8e8ff33bef82fc0160feafcd1e06b75c" src="https://github.com/user-attachments/assets/72bde825-011a-4e58-a1e9-4cf369073586" />

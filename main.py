@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import inspect
 import random
 import re
 import asyncio
@@ -9,11 +10,20 @@ import time
 import zipfile
 import aiohttp
 from pathlib import Path
+from typing import Any
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import Image, Plain
 from astrbot.api.star import Context, Star, register
+
+try:
+    from astrbot.api.message_components import At
+except ImportError:
+    try:
+        from astrbot.core.message.components import At
+    except ImportError:
+        At = None
 
 PLUGIN_NAME = "astrbot_plugin_LLM_jrlp"
 PLUGIN_DIR = Path(__file__).resolve().parent
@@ -110,7 +120,7 @@ PROMPT_EMPTY = (
     "astrbot_plugin_LLM_jrlp",
     "galgame-LLM-jrlp",
     "今日老婆插件移植版：随机抽一位 gal 角色作为今日老婆，支持换老婆、结婚、离婚，回复完全由 LLM 生成",
-    "1.1.3",
+    "1.2.0",
 )
 class JrlpPlugin(Star):
     def __init__(self, context: Context, config: dict | None = None):
@@ -120,8 +130,15 @@ class JrlpPlugin(Star):
         self._dl_running = False
         self._dl_status = "idle"
         self._dl_progress = ""
+        self._group_member_cache: dict[str, tuple[float, set[str]]] = {}
+        self._coord_session: aiohttp.ClientSession | None = None
         self._migrate_legacy_data()
         self._load()
+
+    async def terminate(self):
+        if self._coord_session is not None and not self._coord_session.closed:
+            await self._coord_session.close()
+            self._coord_session = None
 
         # 注意：不在 __init__ 自动拉起外网大文件下载线程，确保在沙箱加载、测试及市场解析时零开销纯净启动
 
@@ -143,6 +160,246 @@ class JrlpPlugin(Star):
     @property
     def use_mirror_accelerate(self) -> bool:
         return bool(self._cfg("use_mirror_accelerate", False))
+
+    # ─── 多 Bot 协调与共享状态 ─────────────────────────────────────────
+    def _coord_url(self) -> str:
+        return str(self._cfg("coord_url", "") or "").strip().rstrip("/")
+
+    def _coord_enabled(self) -> bool:
+        return bool(self._cfg("enable_multi_bot_coord", True)) and bool(self._coord_url())
+
+    def _coord_share_data(self) -> bool:
+        return self._coord_enabled() and bool(self._cfg("coord_share_data", True))
+
+    def _coord_bot_ids(self) -> set[str]:
+        raw = self._cfg("coord_bot_ids", [])
+        if isinstance(raw, str):
+            parts = re.split(r"[\s,;，；]+", raw.strip())
+        elif isinstance(raw, (list, tuple, set)):
+            parts = [str(x).strip() for x in raw]
+        else:
+            parts = []
+        return {p for p in parts if p and p.isdigit()}
+
+    def _coord_min_bots(self) -> int:
+        try:
+            return max(2, int(self._cfg("coord_min_bots", 2)))
+        except Exception:
+            return 2
+
+    async def _get_coord_session(self) -> aiohttp.ClientSession:
+        if self._coord_session is None or self._coord_session.closed:
+            timeout = aiohttp.ClientTimeout(total=10, connect=2)
+            self._coord_session = aiohttp.ClientSession(timeout=timeout)
+        return self._coord_session
+
+    async def _coord_get(self, path: str, timeout_s: float = 2.0) -> dict[str, Any] | None:
+        base = self._coord_url()
+        if not base:
+            return None
+        try:
+            session = await self._get_coord_session()
+            async with session.get(f"{base}{path}", timeout=aiohttp.ClientTimeout(total=timeout_s)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data if isinstance(data, dict) else None
+        except Exception as exc:
+            logger.debug(f"[LLM-jrlp] coord GET {path} failed: {exc}")
+        return None
+
+    async def _coord_post(
+        self, path: str, payload: dict[str, Any], timeout_s: float = 5.0
+    ) -> dict[str, Any] | None:
+        base = self._coord_url()
+        if not base:
+            return None
+        try:
+            session = await self._get_coord_session()
+            async with session.post(
+                f"{base}{path}",
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=timeout_s),
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data if isinstance(data, dict) else None
+        except Exception as exc:
+            logger.debug(f"[LLM-jrlp] coord POST {path} failed: {exc}")
+        return None
+
+    @staticmethod
+    def _get_self_id(event: AstrMessageEvent) -> str:
+        try:
+            if hasattr(event, "get_self_id") and callable(event.get_self_id):
+                sid = str(event.get_self_id() or "").strip()
+                if sid:
+                    return sid
+        except Exception:
+            pass
+        msg_obj = getattr(event, "message_obj", None)
+        return str(getattr(msg_obj, "self_id", "") or "").strip()
+
+    @staticmethod
+    def _extract_at_qqs(event: AstrMessageEvent) -> list[str]:
+        msg_obj = getattr(event, "message_obj", None)
+        components: list[Any] = []
+        try:
+            if hasattr(event, "get_messages") and callable(event.get_messages):
+                components = list(event.get_messages() or [])
+        except Exception:
+            pass
+        if not components and msg_obj is not None:
+            components = list(getattr(msg_obj, "message", None) or [])
+        at_qqs: list[str] = []
+        for comp in components:
+            comp_cls_name = comp.__class__.__name__.lower()
+            comp_type = str(getattr(comp, "type", "") or "").lower()
+            if (At is not None and isinstance(comp, At)) or comp_cls_name == "at" or comp_type == "at":
+                qq_val = str(getattr(comp, "qq", "") or "").strip()
+                if qq_val and qq_val.lower() != "all":
+                    at_qqs.append(qq_val)
+        return at_qqs
+
+    async def _call_onebot(self, event: AstrMessageEvent, action: str, **params: Any) -> Any:
+        bot = getattr(event, "bot", None)
+        fn = getattr(bot, "call_action", None) if bot else None
+        if not callable(fn):
+            api = getattr(bot, "api", None) if bot else None
+            fn = getattr(api, "call_action", None) if api else None
+        if not callable(fn):
+            return None
+        res = fn(action, **params)
+        if inspect.isawaitable(res):
+            res = await res
+        return res
+
+    async def _get_group_members_cached(self, event: AstrMessageEvent, group_id: str) -> set[str]:
+        now = time.monotonic()
+        cached = self._group_member_cache.get(group_id)
+        if cached and (now - cached[0] < 300.0):
+            return cached[1]
+        try:
+            res = await self._call_onebot(event, "get_group_member_list", group_id=int(group_id))
+            members: set[str] = set()
+            items = res if isinstance(res, list) else (res.get("data", []) if isinstance(res, dict) else [])
+            for item in items:
+                if isinstance(item, dict) and item.get("user_id") is not None:
+                    members.add(str(item["user_id"]).strip())
+            if members:
+                self._group_member_cache[group_id] = (now, members)
+                return members
+        except Exception as exc:
+            logger.debug(f"[LLM-jrlp] get_group_member_list({group_id}) failed: {exc}")
+        return cached[1] if cached else set()
+
+    def _is_directed_to_other(self, event: AstrMessageEvent) -> bool:
+        """Return True if message explicitly @mentions other user(s)/bot(s) and NOT this bot."""
+        at_qqs = self._extract_at_qqs(event)
+        if not at_qqs:
+            return False
+        self_id = self._get_self_id(event)
+        if self_id and self_id in at_qqs:
+            return False
+        return True
+
+    async def _should_handle_as_leader(self, event: AstrMessageEvent, action_key: str) -> bool:
+        """Coordinate across bots when multiple bots are in the same group.
+
+        Returns True if this bot should handle and reply; False if another bot was elected.
+        """
+        if self._is_directed_to_other(event):
+            return False
+
+        if not self._coord_enabled():
+            return True
+
+        group_id = str(event.get_group_id() or "").strip()
+        if not group_id:
+            return True
+
+        self_id = self._get_self_id(event)
+        sender_id = str(event.get_sender_id() or "").strip()
+        if not self_id or not sender_id:
+            return True
+
+        coord_ids = self._coord_bot_ids()
+        if coord_ids and self_id not in coord_ids:
+            return True
+
+        at_qqs = self._extract_at_qqs(event)
+        if not coord_ids:
+            health = await self._coord_get("/health", timeout_s=1.5)
+            if health and isinstance(health.get("registered_bots"), dict):
+                coord_ids = {str(k) for k in health["registered_bots"].keys() if str(k).isdigit()}
+            coord_ids.add(self_id)
+
+        expected_count = 0
+        if at_qqs:
+            mentioned_coord = {q for q in at_qqs if q in coord_ids} if coord_ids else set(at_qqs)
+            if len(mentioned_coord) <= 1:
+                return True
+            expected_count = len(mentioned_coord)
+        else:
+            members = await self._get_group_members_cached(event, group_id)
+            if not members or not coord_ids:
+                return True
+            present = members & coord_ids
+            if len(present) < self._coord_min_bots():
+                return True
+            expected_count = len(present)
+
+        join_ms = max(100, min(3000, int(self._cfg("coord_join_window_ms", 550))))
+        bot_name = ""
+        try:
+            if hasattr(event, "get_self_name") and callable(event.get_self_name):
+                bot_name = str(event.get_self_name() or "").strip()
+        except Exception:
+            pass
+
+        resp = await self._coord_post(
+            "/coord/jrlp/elect",
+            {
+                "group_id": group_id,
+                "sender_id": sender_id,
+                "action_key": action_key,
+                "bot_id": self_id,
+                "bot_name": bot_name or self_id,
+                "expected_count": expected_count,
+                "join_window_ms": join_ms,
+            },
+            timeout_s=(join_ms / 1000.0) + 2.5,
+        )
+        if not resp or not resp.get("ok"):
+            return True
+        if resp.get("is_leader"):
+            return True
+        event.stop_event()
+        return False
+
+    async def _load_user_state(self, uid: str) -> dict:
+        if self._coord_share_data():
+            resp = await self._coord_get(f"/coord/jrlp/user/{uid}", timeout_s=2.0)
+            if resp and resp.get("ok") and isinstance(resp.get("user"), dict):
+                self._data["users"][uid] = resp["user"]
+                return self._data["users"][uid]
+        return self._user(uid)
+
+    async def _save_user_state(self, uid: str) -> None:
+        self._save()
+        if self._coord_share_data():
+            user = self._user(uid)
+            await self._coord_post(
+                f"/coord/jrlp/user/{uid}",
+                {"user": user},
+                timeout_s=2.0,
+            )
+
+    async def _get_married_count(self) -> int:
+        if self._coord_share_data():
+            resp = await self._coord_get("/coord/jrlp/stats", timeout_s=1.5)
+            if resp and resp.get("ok") and resp.get("married_count") is not None:
+                return int(resp["married_count"])
+        return sum(1 for u in self._data["users"].values() if u.get("marriage"))
 
     # ─── 图库后台异步流式下载与解压（aiohttp + asyncio）──────────────────
     def _get_download_urls(self) -> list[str]:
@@ -357,16 +614,20 @@ class JrlpPlugin(Star):
             user["dailyCount"] = 0
             user["wife"] = None
             self._save()
+            return True
+        return False
 
     def _check_marriage_expiry(self, uid: str):
         user = self._user(uid)
         m = user.get("marriage")
         if not m:
-            return
+            return False
         elapsed_days = int((time.time() - m["startTimestamp"] / 1000) / MS_PER_DAY)
         if self.marriage_duration - elapsed_days <= 0:
             user["marriage"] = None
             self._save()
+            return True
+        return False
 
     @staticmethod
     def _married_days(marriage: dict) -> int:
@@ -721,31 +982,50 @@ class JrlpPlugin(Star):
     @filter.command("jrlp", alias={"今日老婆"})
     async def jrlp(self, event: AstrMessageEvent):
         """今日老婆。子指令：status / 结婚 / 离婚 / download / help"""
+        if self._is_directed_to_other(event):
+            return
         if self._claim_event(event):
             return
         arg = event.message_str.strip().split(maxsplit=1)
         sub = arg[1].strip().lower() if len(arg) > 1 else ""
         if sub in ("status", "状态"):
+            if not await self._should_handle_as_leader(event, "jrlp:status"):
+                return
             async for r in self._status(event):
                 yield r
+            event.stop_event()
             return
         if sub in ("结婚", "marry"):
+            if not await self._should_handle_as_leader(event, "jrlp:marry"):
+                return
             async for r in self._marry(event):
                 yield r
+            event.stop_event()
             return
         if sub in ("离婚", "divorce"):
+            if not await self._should_handle_as_leader(event, "jrlp:divorce"):
+                return
             async for r in self._divorce(event):
                 yield r
+            event.stop_event()
             return
         if sub in ("download", "下载", "下载图库", "图库下载"):
+            if not await self._should_handle_as_leader(event, "jrlp:download"):
+                return
             async for r in self._download_command(event, force=False):
                 yield r
+            event.stop_event()
             return
         if sub in ("force-download", "强制下载", "强制下载图库"):
+            if not await self._should_handle_as_leader(event, "jrlp:force_download"):
+                return
             async for r in self._download_command(event, force=True):
                 yield r
+            event.stop_event()
             return
         if sub in ("help", "帮助", "-h", "--help"):
+            if not await self._should_handle_as_leader(event, "jrlp:help"):
+                return
             help_text = (
                 "【galgame-LLM-jrlp 今日老婆】指令说明：\n"
                 "• jrlp / 今日老婆 ：抽取今日老婆（每天限 1 位）\n"
@@ -757,60 +1037,94 @@ class JrlpPlugin(Star):
                 "支持带唤醒前缀（如 ~jrlp）或群内直接发送指令。"
             )
             yield event.plain_result(help_text)
+            event.stop_event()
+            return
+        if not await self._should_handle_as_leader(event, "jrlp:draw"):
             return
         async for r in self._draw(event):
             yield r
+        event.stop_event()
 
     @filter.command("hlp", alias={"换老婆"})
     async def hlp(self, event: AstrMessageEvent):
         """换老婆（每日有限次数）"""
+        if self._is_directed_to_other(event):
+            return
         if self._claim_event(event):
+            return
+        if not await self._should_handle_as_leader(event, "jrlp:hlp"):
             return
         async for r in self._redraw(event):
             yield r
+        event.stop_event()
 
     # ─── 无前缀触发 ────────────────────────────────────────────────────
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_plain_message(self, event: AstrMessageEvent):
+        if self._is_directed_to_other(event):
+            return
         text = event.message_str.strip()
         low = text.lower()
         if low in ("jrlp", "今日老婆", "/jrlp", "/今日老婆"):
             if self._claim_event(event):
                 return
+            if not await self._should_handle_as_leader(event, "jrlp:draw"):
+                return
             async for r in self._draw(event):
                 yield r
+            event.stop_event()
         elif low in ("hlp", "换老婆", "/hlp", "/换老婆"):
             if self._claim_event(event):
                 return
+            if not await self._should_handle_as_leader(event, "jrlp:hlp"):
+                return
             async for r in self._redraw(event):
                 yield r
+            event.stop_event()
         elif low in ("jrlp status", "今日老婆 status", "jrlp状态", "今日老婆状态", "jrlp 状态", "今日老婆 状态"):
             if self._claim_event(event):
                 return
+            if not await self._should_handle_as_leader(event, "jrlp:status"):
+                return
             async for r in self._status(event):
                 yield r
+            event.stop_event()
         elif low in ("jrlp 结婚", "今日老婆 结婚", "和今日老婆结婚", "与今日老婆结婚", "jrlp marry", "jrlp结婚"):
             if self._claim_event(event):
                 return
+            if not await self._should_handle_as_leader(event, "jrlp:marry"):
+                return
             async for r in self._marry(event):
                 yield r
+            event.stop_event()
         elif low in ("jrlp 离婚", "今日老婆 离婚", "和今日老婆离婚", "与今日老婆离婚", "jrlp divorce", "jrlp离婚"):
             if self._claim_event(event):
                 return
+            if not await self._should_handle_as_leader(event, "jrlp:divorce"):
+                return
             async for r in self._divorce(event):
                 yield r
+            event.stop_event()
         elif low in ("jrlp download", "今日老婆 download", "下载图库", "jrlp下载图库", "jrlp 下载图库"):
             if self._claim_event(event):
                 return
+            if not await self._should_handle_as_leader(event, "jrlp:download"):
+                return
             async for r in self._download_command(event, force=False):
                 yield r
+            event.stop_event()
         elif low in ("jrlp force-download", "今日老婆 force-download", "强制下载图库", "jrlp强制下载", "jrlp 强制下载图库"):
             if self._claim_event(event):
                 return
+            if not await self._should_handle_as_leader(event, "jrlp:force_download"):
+                return
             async for r in self._download_command(event, force=True):
                 yield r
+            event.stop_event()
         elif low in ("jrlp help", "今日老婆 help", "jrlp帮助", "今日老婆帮助", "jrlp 帮助", "今日老婆 帮助"):
             if self._claim_event(event):
+                return
+            if not await self._should_handle_as_leader(event, "jrlp:help"):
                 return
             help_text = (
                 "【galgame-LLM-jrlp 今日老婆】指令说明：\n"
@@ -823,14 +1137,18 @@ class JrlpPlugin(Star):
                 "支持带唤醒前缀（如 ~jrlp）或群内直接发送指令。"
             )
             yield event.plain_result(help_text)
+            event.stop_event()
 
     # ─── 核心逻辑 ──────────────────────────────────────────────────────
     async def _draw(self, event: AstrMessageEvent):
         uid = event.get_sender_id()
         name = event.get_sender_name() or "你"
-        self._reset_if_new_day(uid)
-        self._check_marriage_expiry(uid)
-        user = self._user(uid)
+        user = await self._load_user_state(uid)
+        changed = self._reset_if_new_day(uid)
+        if self._check_marriage_expiry(uid):
+            changed = True
+        if changed:
+            await self._save_user_state(uid)
 
         marriage = user.get("marriage")
         if marriage:
@@ -889,7 +1207,7 @@ class JrlpPlugin(Star):
 
         user["wife"] = {"name": chara["name"]}
         user["dailyCount"] += 1
-        self._save()
+        await self._save_user_state(uid)
 
         text = await self._llm(
             event,
@@ -901,9 +1219,12 @@ class JrlpPlugin(Star):
     async def _redraw(self, event: AstrMessageEvent):
         uid = event.get_sender_id()
         name = event.get_sender_name() or "你"
-        self._reset_if_new_day(uid)
-        self._check_marriage_expiry(uid)
-        user = self._user(uid)
+        user = await self._load_user_state(uid)
+        changed = self._reset_if_new_day(uid)
+        if self._check_marriage_expiry(uid):
+            changed = True
+        if changed:
+            await self._save_user_state(uid)
 
         if user.get("marriage"):
             text = await self._llm(
@@ -964,7 +1285,7 @@ class JrlpPlugin(Star):
 
         user["wife"] = {"name": chara["name"]}
         user["dailyCount"] += 1
-        self._save()
+        await self._save_user_state(uid)
 
         text = await self._llm(
             event,
@@ -976,9 +1297,12 @@ class JrlpPlugin(Star):
     async def _marry(self, event: AstrMessageEvent):
         uid = event.get_sender_id()
         name = event.get_sender_name() or "你"
-        self._reset_if_new_day(uid)
-        self._check_marriage_expiry(uid)
-        user = self._user(uid)
+        user = await self._load_user_state(uid)
+        changed = self._reset_if_new_day(uid)
+        if self._check_marriage_expiry(uid):
+            changed = True
+        if changed:
+            await self._save_user_state(uid)
 
         marriage = user.get("marriage")
         if marriage:
@@ -1012,7 +1336,7 @@ class JrlpPlugin(Star):
             "wife": {"name": wife["name"]},
             "startTimestamp": int(time.time() * 1000),
         }
-        self._save()
+        await self._save_user_state(uid)
 
         text = await self._llm(
             event,
@@ -1026,9 +1350,12 @@ class JrlpPlugin(Star):
     async def _divorce(self, event: AstrMessageEvent):
         uid = event.get_sender_id()
         name = event.get_sender_name() or "你"
-        self._reset_if_new_day(uid)
-        self._check_marriage_expiry(uid)
-        user = self._user(uid)
+        user = await self._load_user_state(uid)
+        changed = self._reset_if_new_day(uid)
+        if self._check_marriage_expiry(uid):
+            changed = True
+        if changed:
+            await self._save_user_state(uid)
 
         marriage = user.get("marriage")
         if not marriage:
@@ -1042,7 +1369,7 @@ class JrlpPlugin(Star):
 
         wife_name = marriage["wife"]["name"]
         user["marriage"] = None
-        self._save()
+        await self._save_user_state(uid)
 
         text = await self._llm(
             event,
@@ -1053,7 +1380,7 @@ class JrlpPlugin(Star):
 
     async def _status(self, event: AstrMessageEvent):
         total = len(self._list_images())
-        married = sum(1 for u in self._data["users"].values() if u.get("marriage"))
+        married = await self._get_married_count()
         dl_info = ""
         if self._dl_running:
             dl_info = f"\n图库下载进度: {self._dl_status} - {self._dl_progress}"
